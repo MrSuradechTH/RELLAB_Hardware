@@ -16,7 +16,7 @@ bool avialable_wifi = false;
 
 HTTPClient http;
 
-const char* url = "http://192.168.17.39:8005/record/add";
+const char* url = "https://rellabapi.suradech.com/record/add";
 const int http_timeout = 800;
 
 //json
@@ -85,13 +85,20 @@ String rtc_date_time_old, rtc_date_time, rtc_date;
 const int CS = 5;
 bool avialable_sd_card = false;
 int reconnect_sd_card_count = 0;
-int sd_write_count = 0;
 
 File myFile;
 File record_offline_file;
 File record_file;
 File alarm_file;
 size_t sd_result;
+
+const int buffer_size = 30;
+int record_buffer_size = 0;
+int alarm_buffer_size = 0;
+int record_offline_buffer_size = 0;
+String record_buffer[buffer_size];
+String alarm_buffer[buffer_size];
+String record_offline_buffer[buffer_size];
 
 //rom data
 #include <Preferences.h>
@@ -550,20 +557,30 @@ void remove_file(const char * path) {
 
 void store_data_to_sd_card() {
   long millis_sd, millis_sd_old = millis();
+  
   if (avialable_sd_card == false) {
     Serial.println("Not found SD card");
     return;
   } else {
-    if (rtc_date != rtc_get_date() || sd_write_count > 8) {
-      if (sd_write_count > 8) {
-        alarm_file.close();
-        record_file.close();
-        record_offline_file.close();
-        
-        sd_write_count = 0;
+    rtc_date = rtc_get_date();
+
+    //write record data to sd card
+    String record_data = "{date : \"" + rtc_date_time + "\", machine_name : \"" + host_name + "\", data : [";
+    for (uint8_t i = 0; i < sizeof(mcp) / sizeof(mcp[0]); i++) {
+      record_data += "{name : \"" + mcp9600_data_name[i] + "\", value : " + String(mcp9600_value[i], 2) + ", min_limit : " + String(mcp9600_min_limit[i], 2) + ", max_limit : " + String(mcp9600_max_limit[i], 2) + "}";
+      if (i < sizeof(mcp) / sizeof(mcp[0]) - 1) {
+        record_data += ", ";
       }
-      
-      rtc_date = rtc_get_date();
+    }
+    record_data += "], second : " + String(rtc_get_timestamp()) + "}";
+
+    //    insert_line(("/record_" + rtc_date + ".txt").c_str(), record_data.c_str());
+    Serial.println("record_buffer before is : " + String(record_buffer_size));
+    if (record_buffer_size < buffer_size - 1) {
+      record_buffer[record_buffer_size] = record_data;
+      record_buffer_size++;
+    }else {
+      record_buffer[record_buffer_size] = record_data;
 
       record_file = SD.open(("/record_" + rtc_date + ".txt").c_str(), FILE_APPEND);
 
@@ -580,85 +597,87 @@ void store_data_to_sd_card() {
         }
       }
 
-      delay(50);
-      alarm_file = SD.open(("/alarm_" + rtc_date + ".txt").c_str(), FILE_APPEND);
-
-      if (!alarm_file) {
-        Serial.println("File not found or failed to open : alarm_file");
-        alarm_file = SD.open(("/alarm_" + rtc_date + ".txt").c_str(), FILE_WRITE);
-        if (!alarm_file) {
-          Serial.println("Still failed to open : alarm_file");
-        } else {
-          Serial.println("Created new file : alarm_file");
-          alarm_file.close();
-
-          alarm_file = SD.open(("/alarm_" + rtc_date + ".txt").c_str(), FILE_APPEND);
-        }
+      delay(10);
+      
+      for (int i = 0; i <= record_buffer_size; i++) {
+        record_file.println(record_buffer[i]);
+        Serial.println("store data : " + record_buffer[i]);
+        delay(5);
       }
 
-      delay(50);
+      record_file.flush();
+      // record_file.close();
+      record_buffer_size = 0;
 
-      record_offline_file = SD.open("/record_offline.txt", FILE_APPEND);
-
-      if (!record_offline_file) {
-        Serial.println("File not found or failed to open : record_offline_file");
-        record_offline_file = SD.open("/record_offline.txt", FILE_WRITE);
-        if (!record_offline_file) {
-          Serial.println("Still failed to open : record_offline_file");
-        } else {
-          Serial.println("Created new file : record_offline_file");
-          record_offline_file.close();
-
-          record_offline_file = SD.open("/record_offline.txt", FILE_APPEND);
-        }
-      }
-
-      delay(50);
+      delay(10);
     }
+    Serial.println("record_buffer after is : " + String(record_buffer_size));
 
-    //write record data to sd card
-    String record_data = "{date : \"" + rtc_date_time + "\", machine_name : \"" + host_name + "\", data : [";
-    for (uint8_t i = 0; i < sizeof(mcp) / sizeof(mcp[0]); i++) {
-      record_data += "{name : \"" + mcp9600_data_name[i] + "\", value : " + String(mcp9600_value[i], 2) + ", min_limit : " + String(mcp9600_min_limit[i], 2) + ", max_limit : " + String(mcp9600_max_limit[i], 2) + "}";
-      if (i < sizeof(mcp) / sizeof(mcp[0]) - 1) {
-        record_data += ", ";
-      }
-    }
-    record_data += "], second : " + String(rtc_get_timestamp()) + "}";
+    // sd_result = record_file.println(record_data.c_str());
 
-    //    insert_line(("/record_" + rtc_date + ".txt").c_str(), record_data.c_str());
-
-
-      sd_result = record_file.println(record_data.c_str());
-
-      if (sd_result == 0) {
-        Serial.println("file : /record_" + rtc_date + ".txt | write fail!");
-        record_file = SD.open(("/record_" + rtc_date + ".txt").c_str(), FILE_APPEND);
-        record_file.println(record_data.c_str());
-        record_file.flush();
-      } else {
-        Serial.println("file : /record_" + rtc_date + ".txt | write success!");
-        record_file.flush();
-      }
-
-      delay(50);
+    // if (sd_result == 0) {
+    //   Serial.println("file : /record_" + rtc_date + ".txt | write fail!");
+    //   record_file = SD.open(("/record_" + rtc_date + ".txt").c_str(), FILE_APPEND);
+    //   record_file.println(record_data.c_str());
+    //   record_file.flush();
+    // } else {
+    //   Serial.println("file : /record_" + rtc_date + ".txt | write success!");
+    //   record_file.flush();
+    // }
 
     if (avialable_wifi == false) {
       //      insert_line("/record_offline.txt", record_data.c_str());
 
-      sd_result = record_offline_file.println(record_data.c_str());
+      // sd_result = record_offline_file.println(record_data.c_str());
 
-      if (sd_result == 0) {
-        Serial.println("file : /record_offline.txt | write fail!");
-        record_offline_file = SD.open("/record_offline.txt", FILE_APPEND);
-        record_offline_file.println(record_data.c_str());
-        record_offline_file.flush();
-      } else {
-        Serial.println("file : /record_offline.txt | write success!");
-        record_offline_file.flush();
-      }
+      // if (sd_result == 0) {
+      //   Serial.println("file : /record_offline.txt | write fail!");
+      //   record_offline_file = SD.open("/record_offline.txt", FILE_APPEND);
+      //   record_offline_file.println(record_data.c_str());
+      //   record_offline_file.flush();
+      // } else {
+      //   Serial.println("file : /record_offline.txt | write success!");
+      //   record_offline_file.flush();
+      // }
 
-      delay(50);
+      Serial.println("record_offline_buffer before is : " + String(record_offline_buffer_size));
+        if (record_offline_buffer_size < buffer_size - 1) {
+          record_offline_buffer[record_offline_buffer_size] = record_data;
+          record_offline_buffer_size++;
+        }else {
+          record_offline_buffer[record_offline_buffer_size] = record_data;
+
+          record_offline_file = SD.open(("/record_offline_" + rtc_date + ".txt").c_str(), FILE_APPEND);
+
+          if (!record_offline_file) {
+            Serial.println("File not found or failed to open : record_offline_file");
+            record_offline_file = SD.open(("/record_offline_" + rtc_date + ".txt").c_str(), FILE_WRITE);
+            if (!record_offline_file) {
+              Serial.println("Still failed to open : record_offline_file");
+            } else {
+              Serial.println("Created new file : record_offline_file");
+              record_offline_file.close();
+              record_offline_file = SD.open(("/record_offline_" + rtc_date + ".txt").c_str(), FILE_APPEND);
+            }
+          }
+
+          delay(10);
+          
+          for (int i = 0; i <= record_offline_buffer_size; i++) {
+            record_offline_file.println(record_offline_buffer[i]);
+            Serial.println("store data : " + record_offline_buffer[i]);
+            delay(5);
+          }
+
+          record_offline_file.flush();
+          // record_offline_file.close();
+          record_offline_buffer_size = 0;
+
+          delay(10);
+        }
+        Serial.println("record_offline_buffer after is : " + String(record_offline_buffer_size));
+
+      // delay(50);
     }
 
     //write alarm to sd card
@@ -678,23 +697,59 @@ void store_data_to_sd_card() {
 
         //        insert_line(("/alarm_" + rtc_date + ".txt").c_str(), alarm_data.c_str());
 
-        sd_result = alarm_file.println(alarm_data.c_str());
+        // sd_result = alarm_file.println(alarm_data.c_str());
 
-        if (sd_result == 0) {
-          Serial.println("file : /record_" + rtc_date + ".txt | write fail!");
+        // if (sd_result == 0) {
+        //   Serial.println("file : /record_" + rtc_date + ".txt | write fail!");
+        //   alarm_file = SD.open(("/alarm_" + rtc_date + ".txt").c_str(), FILE_APPEND);
+        //   alarm_file.println(alarm_data.c_str());
+        //   alarm_file.flush();
+        // } else {
+        //   Serial.println("file : /record_" + rtc_date + ".txt | write success!");
+        //   alarm_file.flush();
+        // }
+
+        Serial.println("alarm_buffer before is : " + String(alarm_buffer_size));
+        if (alarm_buffer_size < buffer_size - 1) {
+          alarm_buffer[alarm_buffer_size] = alarm_data;
+          alarm_buffer_size++;
+        }else {
+          alarm_buffer[alarm_buffer_size] = alarm_data;
+
           alarm_file = SD.open(("/alarm_" + rtc_date + ".txt").c_str(), FILE_APPEND);
-          alarm_file.println(alarm_data.c_str());
-          alarm_file.flush();
-        } else {
-          Serial.println("file : /record_" + rtc_date + ".txt | write success!");
-          alarm_file.flush();
-        }
 
-        delay(50);
+          if (!alarm_file) {
+            Serial.println("File not found or failed to open : alarm_file");
+            alarm_file = SD.open(("/alarm_" + rtc_date + ".txt").c_str(), FILE_WRITE);
+            if (!alarm_file) {
+              Serial.println("Still failed to open : alarm_file");
+            } else {
+              Serial.println("Created new file : alarm_file");
+              alarm_file.close();
+
+              alarm_file = SD.open(("/alarm_" + rtc_date + ".txt").c_str(), FILE_APPEND);
+            }
+          }
+
+          delay(10);
+          
+          for (int i = 0; i <= alarm_buffer_size; i++) {
+            alarm_file.println(alarm_buffer[i]);
+            Serial.println("store data : " + alarm_buffer[i]);
+            delay(5);
+          }
+
+          alarm_file.flush();
+          // alarm_file.close();
+          alarm_buffer_size = 0;
+
+          delay(10);
+        }
+        Serial.println("alarm_buffer after is : " + String(alarm_buffer_size));
+
+        delay(10);
       }
     }
-
-    sd_write_count++;
 
     millis_sd = millis();
     Serial.println(rtc_date_time + " Done to insert line using time = " + String(millis_sd - millis_sd_old));
