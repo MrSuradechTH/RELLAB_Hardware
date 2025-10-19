@@ -7,6 +7,7 @@
 const char* ssid = "MrSuradechTH";
 const char* password = "1234567890";
 int reconnect_wifi_count = 0;
+bool avialable_wifi = false;
 
 //http
 #include <HTTPClient.h>
@@ -15,7 +16,7 @@ int reconnect_wifi_count = 0;
 
 HTTPClient http;
 
-const char* url = "http://192.168.6.39:8005/record/add";
+const char* url = "https://rellabapi.suradech.com/record/add";
 const int http_timeout = 800;
 
 //json
@@ -26,7 +27,7 @@ const int http_timeout = 800;
 #include <WiFiUdp.h>
 #include <ArduinoOTA.h>
 
-const char* host_name = "DEMO_ Machine";
+const char* host_name = "DEMO_Machine";
 
 //OLED
 #include <Adafruit_GFX.h>
@@ -42,8 +43,8 @@ Adafruit_SSD1306 display(-1);
 #include "Adafruit_MCP9600.h"
 
 const uint8_t mcp9600_address[] = {0x67, 0x60, 0x65, 0x66, 0x64};
-float mcp9600_max_limit[] = {40.00, 40.00, 40.00, 40.00, 40.00};
-float mcp9600_min_limit[] = {-10.00, -10.00, -10.00, -10.00, -10.00};
+float mcp9600_max_limit[] = {180.00, 180.00, 180.00, 180.00, 180.00};
+float mcp9600_min_limit[] = { -150.00, -150.00, -150.00, -150.00, -150.00};
 Adafruit_MCP9600 mcp[sizeof(mcp9600_address) / sizeof(mcp9600_address[0])];
 float mcp9600_value[sizeof(mcp9600_address) / sizeof(mcp9600_address[0])];
 String mcp9600_data_name[sizeof(mcp9600_address) / sizeof(mcp9600_address[0])] = {"CH1", "CH2", "CH3", "CH4", "CH5"};
@@ -56,8 +57,8 @@ Ambient_Resolution ambientRes = RES_ZERO_POINT_03125;
 const int trimmer[] = {32, 35, 34, 39, 36};
 const float max_trimmer_value = 4085;
 const float min_trimmer_value = 10;
-const float out_max_trimmer_value = 0.50;
-const float out_min_trimmer_value = -0.50;
+const float out_max_trimmer_value = 3.00;
+const float out_min_trimmer_value = -3.00;
 const int trimmer_averaging = 25;
 static float trimmer_value[sizeof(trimmer) / sizeof(trimmer[0])];
 
@@ -75,36 +76,63 @@ const int resolution = 8;
 #include "pcf8563.h"
 
 PCF8563_Class rtc;
+String rtc_date_time_old, rtc_date_time, rtc_date;
+long rtc_time_stamp;
 
 //sd_card
 #include <SD.h>
+//#include <SdFat.h>
+//SdFat SD;
+const int CS = 5;
+bool avialable_sd_card = false;
+int reconnect_sd_card_count = 0;
 
 File myFile;
-const int CS = 5;
+File record_file;
+File alarm_file;
+size_t sd_result;
+
+const int buffer_size = 120;
+int record_buffer_size = 0;
+int alarm_buffer_size = 0;
+String record_buffer[buffer_size];
+String alarm_buffer[buffer_size];
+
+//rom data
+#include <Preferences.h>
+Preferences preferences;
 
 //etc
-unsigned long display_millis_now,display_millis_old; //for oled
-unsigned long sd_card_millis_now,sd_card_millis_old; //for sd_card
+unsigned long display_millis_now, display_millis_old; //for oled
+unsigned long sd_card_millis_now, sd_card_millis_old; //for sd_card
 int display_panel = 1; //for oled
 bool is_running = false; //for led
-bool is_warning = false; //for led
-bool is_alarm = false; //for led, buzzer, sd_card
+bool is_warning = true; //for led
+bool is_alarm = false; //for led, buzzer
 String alarm_message[sizeof(mcp9600_address) / sizeof(mcp9600_address[0])] = {"", "", "", "", ""}; //for sd_card
+unsigned long working_time_millis_now, working_time_millis_old; //reset if working over time
+unsigned long last_sd_check = 0;
+int current_file_hour = -1;
 
 //mcp9600
 void update_mcp9600_value() {
   update_trimmer_value();
-  
+
   for (uint8_t i = 0; i < sizeof(mcp) / sizeof(mcp[0]); i++) {
     mcp9600_value[i] = mcp[i].readThermocouple() + trimmer_value[i];
-    // Serial.println("CH " + String(i) + " : " + String(mcp9600_value[i]) + " °C [" + String(mcp[i].readThermocouple()) + "] [" + String(trimmer_value[i]) + "]");
   }
 
-  check_alarm();
-
-//  for (uint8_t i = 0; i < sizeof(mcp9600_address); i++) {
-//    Serial.println("CH " + String(i) + " : " + String(mcp9600_value[i]) + " °C");
-//  }
+  for (uint8_t i = 0; i < sizeof(mcp) / sizeof(mcp[0]); i++) {
+    if (mcp9600_value[i] > mcp9600_max_limit[i]) {
+      alarm_message[i] = mcp9600_data_name[i] + " : " + String(mcp9600_value[i]) + " °C is over max limit at " + String(mcp9600_max_limit[i]) + " °C";
+      mcp9600_alarm[i] = true;
+    } else if (mcp9600_value[i] < mcp9600_min_limit[i]) {
+      alarm_message[i] = mcp9600_data_name[i] + " : " + String(mcp9600_value[i]) + " °C is under min limit at " + String(mcp9600_min_limit[i]) + " °C";
+      mcp9600_alarm[i] = true;
+    } else {
+      mcp9600_alarm[i] = false;
+    }
+  }
 }
 
 //trimmer
@@ -114,14 +142,31 @@ void update_trimmer_value() {
       trimmer_value[i] = (((((constrain(analogRead(trimmer[i]) - min_trimmer_value, 0, max_trimmer_value - min_trimmer_value) / (max_trimmer_value - min_trimmer_value)) * (out_max_trimmer_value - out_min_trimmer_value)) + out_min_trimmer_value) * -1) + trimmer_value[i]) / 2;
     }
   }
-
-//  for (int i = 0; i < sizeof(trimmer) / sizeof(trimmer[0]); i++) {
-//      Serial.println("Trimmer[" + String(i) + "] value : " + String(trimmer_value[i], 2));
-//  }
 }
 
 //oled
 void display_1() {
+
+  if (avialable_wifi == true) {
+    display.setCursor(0, 0);
+    display.println("Wifi : Connected");
+    display.setCursor(0, 8);
+    display.println("IP : " + WiFi.localIP().toString());
+    display.setCursor(0, 16);
+    display.println("RSSI : " + String(WiFi.RSSI()) + " dBm");
+  } else {
+    display.setCursor(0, 0);
+    display.println("Wifi : Disconnected");
+    display.setCursor(0, 8);
+    display.println("IP : XXX.XXX.XXX.XXX");
+    display.setCursor(0, 16);
+    display.println("RSSI : XXX dBm");
+  }
+  display.setCursor(0, 24);
+  display.println("Name : " + String(host_name));
+}
+
+void display_2() {
   display.setCursor(0, 0);
   display.println("CH 1 Temp : " + String(mcp9600_value[0]) + " C");
   display.setCursor(0, 8);
@@ -132,7 +177,7 @@ void display_1() {
   display.println("CH 4 Temp : " + String(mcp9600_value[3]) + " C");
 }
 
-void display_2() {
+void display_3() {
   display.setCursor(0, 0);
   display.println("CH 5 Temp : " + String(mcp9600_value[4]) + " C");
 }
@@ -144,48 +189,65 @@ void update_led_status() {
   digitalWrite(led_red, is_alarm);
 }
 
+//rom record
+void update_record_rom() {
+  preferences.begin("record", false);
+  preferences.putString("rtc_date_time", rtc_date_time);
+  preferences.end();
+}
+
+//rom data
+void update_alarm_rom() {
+  preferences.begin("alarm", false);
+  preferences.putBool("is_running", is_running);
+  preferences.putBool("is_warning", is_warning);
+  preferences.putBool("is_alarm", false);
+  //  preferences.putBool("is_alarm", is_alarm);
+  preferences.end();
+}
+
 //buzzer
 void update_buzzer_status() {
   if (is_alarm) {
     ledcWrite(0, 150);
-  }else {
+  } else {
     ledcWrite(0, 0);
   }
 }
 
 //pcf8563
 unsigned long rtc_date_to_timestamp(RTC_Date date) {
-    struct tm t;
-    t.tm_year = date.year - 1900;
-    t.tm_mon = date.month - 1;
-    t.tm_mday = date.day;
-    t.tm_hour = date.hour;
-    t.tm_min = date.minute;
-    t.tm_sec = date.second;
-    t.tm_isdst = -1;
+  struct tm t;
+  t.tm_year = date.year - 1900;
+  t.tm_mon = date.month - 1;
+  t.tm_mday = date.day;
+  t.tm_hour = date.hour;
+  t.tm_min = date.minute;
+  t.tm_sec = date.second;
+  t.tm_isdst = -1;
 
-    time_t timestamp = mktime(&t);
-    return (unsigned long)timestamp;
+  time_t timestamp = mktime(&t);
+  return (unsigned long)timestamp;
 }
 
-RTC_Date rtc_timestamp_to_date(unsigned long timestamp) {
-    struct tm *t;
-    time_t rawtime = (time_t)timestamp;
-    t = gmtime(&rawtime);
+RTC_Date rtc_time_stamp_to_date(unsigned long timestamp) {
+  struct tm *t;
+  time_t rawtime = (time_t)timestamp;
+  t = gmtime(&rawtime);
 
-    RTC_Date date;
-    date.year = t->tm_year + 1900;
-    date.month = t->tm_mon + 1;
-    date.day = t->tm_mday;
-    date.hour = t->tm_hour;
-    date.minute = t->tm_min;
-    date.second = t->tm_sec;
+  RTC_Date date;
+  date.year = t->tm_year + 1900;
+  date.month = t->tm_mon + 1;
+  date.day = t->tm_mday;
+  date.hour = t->tm_hour;
+  date.minute = t->tm_min;
+  date.second = t->tm_sec;
 
-    return date;
+  return date;
 }
 
 void rtc_update_rtc_date_time(unsigned long time_stamp) {
-  RTC_Date new_date = rtc_timestamp_to_date(time_stamp);
+  RTC_Date new_date = rtc_time_stamp_to_date(time_stamp);
   rtc.setDateTime(new_date.year, new_date.month, new_date.day, new_date.hour, new_date.minute, new_date.second);
 }
 
@@ -196,9 +258,16 @@ String rtc_get_date_time() {
   return String(buffer);
 }
 
+String rtc_get_date() {
+  RTC_Date date = rtc.getDateTime();
+  char buffer[20];
+  snprintf(buffer, sizeof(buffer), "%02d_%02d_%04d %02d_00", date.month, date.day, date.year, date.hour, date.minute, date.second);
+  return String(buffer);
+}
+
 unsigned long rtc_get_timestamp() {
   RTC_Date date = rtc.getDateTime();
-  return rtc_date_to_timestamp(date);
+  return rtc_date_to_timestamp(date) - (60 * 60 * 7);
 }
 
 void rtc_show_date_time() {
@@ -207,121 +276,256 @@ void rtc_show_date_time() {
 }
 
 //sd_card
-void write_file(const char * path, const char * message){
+void write_file(const char * path, const char * message) {
   myFile = SD.open(path, FILE_WRITE);
+
+  if (!myFile) {
+    Serial.println("File not found or failed to open : " + String(path));
+    myFile = SD.open(path, FILE_WRITE);
+    if (!myFile) {
+      Serial.println("Still failed to open : " + String(path));
+      return;
+    } else {
+      Serial.println("Created new file : " + String(path));
+    }
+  }
+
   if (myFile) {
     Serial.printf("Writing to %s ", path);
     myFile.println(message);
     myFile.close();
     Serial.println("completed.");
-  }else {
+  } else {
     Serial.println("error opening file ");
     Serial.println(path);
   }
 }
 
 
-void read_file(const char * path){
+void read_file(const char * path) {
   myFile = SD.open(path);
+  if (!myFile) {
+    Serial.println("File not found or failed to open : " + String(path));
+    myFile = SD.open(path, FILE_WRITE);
+    if (!myFile) {
+      Serial.println("Still failed to open : " + String(path));
+      return;
+    } else {
+      Serial.println("Created new file : " + String(path));
+    }
+  }
+
   if (myFile) {
-     Serial.printf("Reading file from %s\n", path);
+    Serial.printf("Reading file from %s\n", path);
     while (myFile.available()) {
       Serial.write(myFile.read());
     }
     myFile.close();
-  } 
+  }
   else {
     Serial.print("error opening file ");
     Serial.println(path);
   }
 }
 
-int count_line(const char * path) {
-  int lines = 0;
+//bool more_than_zero_line(const char* path) {
+//  int lines = 0;
+//  File myFile = SD.open(path, FILE_READ);
+//
+//  if (!myFile) {
+//    Serial.println("File " + String(path) + " not found...");
+//    return lines;
+//  }
+//
+//  if (myFile) {
+//    const int bufferSize = 2048; // Adjust buffer size as needed
+//    char buffer[bufferSize];
+//
+//    while (myFile.available() && lines == 0) {
+//      int bytesRead = myFile.read((uint8_t*)buffer, bufferSize);
+//      for (int i = 0; i < bytesRead; i++) {
+//        if (buffer[i] == '\n') {
+//          lines++;
+//          break;
+//        }
+//        delay(20);
+//      }
+//      delay(20);
+//    }
+//
+//    myFile.close();
+//  } else {
+//    Serial.println("Error opening file for counting lines");
+//  }
+//
+//  if (lines == 0) {
+//    return false;
+//  }else {
+//    return true;
+//  }
+//}
 
-  if (!SD.exists(path)) {
-    return lines;
-  }
-  
-  myFile = SD.open(path);
-  if (myFile) {
-    while (myFile.available()) {
-      if (myFile.read() == '\n') {
-        lines++;
-      }
-    }
-    myFile.close();
-  } else {
-    Serial.println("error opening file for counting lines");
-  }
-  return lines;
-}
+//int count_line(const char * path) {
+//  int lines = 0;
+//  File myFile = SD.open(path, FILE_READ);
+//
+//  if (!myFile) {
+//    Serial.println("File " + String(path) + " not found...");
+//    return lines;
+//  }
+//
+//  if (myFile) {
+//    const int bufferSize = 2048; // Adjust buffer size as needed
+//    char buffer[bufferSize];
+//
+//    while (myFile.available()) {
+//      int bytesRead = myFile.read((uint8_t*)buffer, bufferSize);
+//      for (int i = 0; i < bytesRead; i++) {
+//        if (buffer[i] == '\n') {
+//          lines++;
+//        }
+//        delay(20);
+//      }
+//      delay(20);
+//    }
+//
+//    myFile.close();
+//  } else {
+//    Serial.println("Error opening file for counting lines");
+//  }
+//
+//  return lines;
+//}
 
-void read_line(const char * path, int lineNumber) {
-  int currentLine = 0;
-  myFile = SD.open(path);
-  if (myFile) {
-    while (myFile.available()) {
-      String line = myFile.readStringUntil('\n');
-      if (currentLine == lineNumber) {
-        Serial.println(line);
-        break;
-      }
-      currentLine++;
-    }
-    myFile.close();
-  } else {
-    Serial.println("error opening file for reading line");
-  }
-}
+//String read_line(const char * path, int lineNumber) {
+//  int currentLine = 0;
+//  String result = "";
+//
+//  myFile = SD.open(path);
+//
+//  if (!myFile) {
+//    Serial.println("File " + String(path) + " not found...");
+//    return "";
+//  }
+//
+//  if (myFile) {
+//    while (myFile.available()) {
+//      String line = myFile.readStringUntil('\n');
+//      if (currentLine == lineNumber) {
+//        Serial.println(line);
+//        result = line;
+//        delay(20);
+//        break;
+//      }
+//      currentLine++;
+//      delay(20);
+//    }
+//    myFile.close();
+//  } else {
+//    Serial.println("error opening file for reading line");
+//  }
+//
+//  return result;
+//}
 
-void write_line(const char * path, const char * message, int lineNumber) {
-  File tempFile = SD.open("/temporary.txt", FILE_WRITE);
-  myFile = SD.open(path);
-  int currentLine = 0;
-  if (myFile && tempFile) {
-    while (myFile.available()) {
-      String line = myFile.readStringUntil('\n');
-      if (currentLine == lineNumber) {
-        tempFile.println(message);
-      } else {
-        tempFile.println(line);
-      }
-      currentLine++;
-    }
-    if (currentLine <= lineNumber) {
-      tempFile.println(message);
-    }
-    myFile.close();
-    tempFile.close();
-    SD.remove(path);
-    SD.rename("/temporary.txt", path);
-  } else {
-    Serial.println("error opening file for writing line");
-  }
-}
+//void write_line(const char * path, const char * message, int lineNumber) {
+//  File tempFile = SD.open("/temporary.txt", FILE_WRITE);
+//  myFile = SD.open(path);
+//
+//  if (!myFile) {
+//    Serial.println("File " + String(path) + " not found...");
+//    return;
+//  }
+//
+//  int currentLine = 0;
+//  if (myFile && tempFile) {
+//    while (myFile.available()) {
+//      String line = myFile.readStringUntil('\n');
+//      if (currentLine == lineNumber) {
+//        tempFile.println(message);
+//      } else {
+//        tempFile.println(line);
+//      }
+//      currentLine++;
+//    }
+//    if (currentLine <= lineNumber) {
+//      tempFile.println(message);
+//    }
+//    myFile.close();
+//    tempFile.close();
+//    SD.remove(path);
+//    SD.rename("/temporary.txt", path);
+//  } else {
+//    Serial.println("error opening file for writing line");
+//  }
+//}
 
 void insert_line(const char * path, const char * message) {
-  myFile = SD.open(path, FILE_WRITE);
+  myFile = SD.open(path, FILE_APPEND);
 
-  if (!myFile) {  
-    Serial.println("File not found, creating file...");
+  if (!myFile) {
+    Serial.println("File not found or failed to open : " + String(path));
     myFile = SD.open(path, FILE_WRITE);
+    if (!myFile) {
+      Serial.println("Still failed to open : " + String(path));
+      return;
+    } else {
+      Serial.println("Created new file : " + String(path));
+    }
   }
-  
-  if (myFile) {
-    myFile.seek(myFile.size());
-    myFile.print("\n");
-    myFile.print(message);
+
+  if (myFile.println(message)) {
+    // Success - flush and close
+    myFile.flush();
     myFile.close();
   } else {
-    Serial.println("error opening file for inserting line");
+    Serial.println("Error writing to file");
+    myFile.close();
   }
+
+  //  if (myFile) {
+  //    // Move to the end of the file
+  //    myFile.seek(myFile.size());
+  //
+  //    // Write the new line
+  //    myFile.print("\n"); // Add a newline before the new message
+  //
+  //    // Break the message into smaller chunks and write them
+  //    const int chunkSize = 64; // Adjust chunk size as needed
+  //    int messageLength = strlen(message);
+  //    int offset = 0;
+  //
+  //    while (offset < messageLength) {
+  //      int chunkLength = min(chunkSize, messageLength - offset);
+  //      myFile.write((const uint8_t*)(message + offset), chunkLength); // Cast to const uint8_t*
+  //      offset += chunkLength;
+  //    }
+  //
+  //    // Flush the data to ensure it's written to the file
+  //    myFile.flush();
+  //
+  //    // Close the file
+  //    myFile.close();
+  //  } else {
+  //    Serial.println("Error opening file for inserting line");
+  //  }
 }
 
 void remove_line(const char * path, int lineNumber) {
   File tempFile = SD.open("/temporary.txt", FILE_WRITE);
   myFile = SD.open(path);
+
+  if (!myFile) {
+    Serial.println("File not found or failed to open : " + String(path));
+    myFile = SD.open(path, FILE_WRITE);
+    if (!myFile) {
+      Serial.println("Still failed to open : " + String(path));
+      return;
+    } else {
+      Serial.println("Created new file : " + String(path));
+    }
+  }
+
   int currentLine = 0;
   if (myFile && tempFile) {
     while (myFile.available()) {
@@ -330,6 +534,7 @@ void remove_line(const char * path, int lineNumber) {
         tempFile.println(line);
       }
       currentLine++;
+      delay(10);
     }
     myFile.close();
     tempFile.close();
@@ -347,151 +552,367 @@ void remove_file(const char * path) {
   } else {
     Serial.printf("File %s does not exist.\n", path);
   }
+  delay(10);
 }
 
 void store_data_to_sd_card() {
-  if (!SD.begin(CS)) {
+  long millis_sd, millis_sd_old = millis();
+  
+  if (avialable_sd_card == false) {
     Serial.println("Not found SD card");
     return;
-  }
+  } else {
+    rtc_time_stamp = rtc_get_timestamp();
+    rtc_date = rtc_get_date();
+    RTC_Date date_now = rtc_time_stamp_to_date(rtc_time_stamp);
 
-  //write record data to sd card
-  String record_data = "{date : \"" + rtc_get_date_time() + "\", machine_id : 1, machine_name : \"machine_name\", data : [";
-  for (uint8_t i = 0; i < sizeof(mcp) / sizeof(mcp[0]); i++) {
-    record_data += "{name : \"" + mcp9600_data_name[i] + "\", value : " + String(mcp9600_value[i], 2) + ", min_limit : " + String(mcp9600_min_limit[i], 2) + ", max_limit : " + String(mcp9600_max_limit[i], 2) + "}";
-    if (i < sizeof(mcp) / sizeof(mcp[0]) - 1) {
-      record_data += ", ";
+    // Force flush buffers every hour transition AND when buffer gets close to full
+    if (current_file_hour != -1 && current_file_hour != date_now.hour) {
+      Serial.println("Hour changed from " + String(current_file_hour) + " to " + String(date_now.hour) + ", flushing buffers");
+      flush_buffers_to_sd_card();
     }
-  }
-  record_data += "], second : " + String(rtc_get_timestamp()) + "}";
+    // Also flush if buffer is getting very full (90% capacity)
+    if (record_buffer_size >= (buffer_size * 0.9)) {
+      Serial.println("Buffer near full (" + String(record_buffer_size) + "/" + String(buffer_size) + "), force flushing");
+      flush_buffers_to_sd_card();
+    }
+    current_file_hour = date_now.hour;
 
-//  Serial.println("Record data inserted: " + record_data);
-
-  insert_line("/data.txt", record_data.c_str());
-
-  //write alarm to sd card
-  if (is_alarm) {
+    //write record data to sd card - add validation
+    String record_data = "{\"date\" : \"" + rtc_date_time + "\", \"machine_name\" : \"" + host_name + "\", \"data\" : [";
     for (uint8_t i = 0; i < sizeof(mcp) / sizeof(mcp[0]); i++) {
-      if (mcp9600_alarm[i] == true) {
-        if (mcp9600_value[i] > mcp9600_max_limit[i]) {
-          String alarm_data = "{date : \"" + rtc_get_date_time() + "\", machine_id : 1, machine_name : \"machine_name\", data_name : \"" + mcp9600_data_name[i] + "\", description : \"" + alarm_message[i] + "\", type : \"over_max_limit\", second : " + String(rtc_get_timestamp()) + "}";
-          
-          insert_line("/alarm.txt", alarm_data.c_str());
-          
-  //        Serial.println("Alarm data inserted: " + alarm_data);
-        } else if (mcp9600_value[i] < mcp9600_min_limit[i]) {
-          String alarm_data = "{date : \"" + rtc_get_date_time() + "\", machine_id : 1, machine_name : \"machine_name\", data_name : \"" + mcp9600_data_name[i] + "\", description : \"" + alarm_message[i] + "\", type : \"under_min_limit\", second : " + String(rtc_get_timestamp()) + "}";
-          
-          insert_line("/alarm.txt", alarm_data.c_str());
-
-  //        Serial.println("Alarm data inserted: " + alarm_data);
-        }
+      // Add validation for sensor values
+      float sensor_value = mcp9600_value[i];
+      if (isnan(sensor_value)) {
+        sensor_value = 0.0; // Use safe default for invalid readings
+      }
+      
+      record_data += "{\"name\" : \"" + mcp9600_data_name[i] + "\", \"value\" : " + String(sensor_value, 2) + ", \"min_limit\" : " + String(mcp9600_min_limit[i], 2) + ", \"max_limit\" : " + String(mcp9600_max_limit[i], 2) + "}";
+      if (i < sizeof(mcp) / sizeof(mcp[0]) - 1) {
+        record_data += ", ";
       }
     }
+    record_data += "], \"second\" : " + String(rtc_get_timestamp()) + "}";
+
+    Serial.println("record_buffer before is : " + String(record_buffer_size));
+    
+    // Simplified buffer logic - just check if there's space
+    if (record_buffer_size < buffer_size - 1) {
+      record_buffer[record_buffer_size] = record_data;
+      record_buffer_size++;
+    } else {
+      // Buffer is full, flush immediately
+      record_buffer[record_buffer_size] = record_data;
+      flush_buffers_to_sd_card();
+    }
+    
+    Serial.println("record_buffer after is : " + String(record_buffer_size));
+
+    //write alarm to sd card - simplified logic
+    for (uint8_t i = 0; i < sizeof(mcp) / sizeof(mcp[0]); i++) {
+      if (mcp9600_alarm[i] == true) {
+        String alarm_data = "";
+
+        if (mcp9600_value[i] > mcp9600_max_limit[i]) {
+          alarm_data = "{\"date\" : \"" + rtc_date_time + "\", \"machine_name\" : \"" + host_name + "\", \"data_name\" : \"" + mcp9600_data_name[i] + "\", \"description\" : \"" + alarm_message[i] + "\", \"type\" : \"over_max_limit\", \"second\" : " + String(rtc_get_timestamp()) + "}";
+        } else if (mcp9600_value[i] < mcp9600_min_limit[i]) {
+          alarm_data = "{\"date\" : \"" + rtc_date_time + "\", \"machine_name\" : \"" + host_name + "\", \"data_name\" : \"" + mcp9600_data_name[i] + "\", \"description\" : \"" + alarm_message[i] + "\", \"type\" : \"under_min_limit\", \"second\" : " + String(rtc_get_timestamp()) + "}";
+        }
+
+        Serial.println("alarm_buffer before is : " + String(alarm_buffer_size));
+        if (alarm_buffer_size < buffer_size - 1) {
+          alarm_buffer[alarm_buffer_size] = alarm_data;
+          alarm_buffer_size++;
+        } else {
+          alarm_buffer[alarm_buffer_size] = alarm_data;
+          flush_buffers_to_sd_card();
+        }
+        Serial.println("alarm_buffer after is : " + String(alarm_buffer_size));
+      }
+    }
+    
+    millis_sd = millis();
+    Serial.println(rtc_date_time + " Done to insert line using time = " + String(millis_sd - millis_sd_old));
   }
 }
 
-// void store_data_to_sd_card() {
-//   String data = "{date : \"" + rtc_get_date_time() + "\", machine_id : 1, machine_name : \"machine_name\", data : [";
-//   for (uint8_t i = 0; i < sizeof(mcp) / sizeof(mcp[0]); i++) {
-//     data += "{name : \"test" + String(i) + "\", value : " + String(mcp9600_value[i], 2) + ", min_limit : " + String(mcp9600_min_limit[i], 2) + ", max_limit : " + String(mcp9600_max_limit[i], 2) + "}";
-//     if (i < sizeof(mcp) / sizeof(mcp[0]) - 1) {
-//       data += ", ";
-//     }
-//   }
-//   data += "], second : " + String(rtc_get_timestamp()) + "}";
-
-//   int maxLine = count_line("/data.txt");
+void flush_buffers_to_sd_card() {
+  Serial.println("Starting buffer flush - Record: " + String(record_buffer_size) + ", Alarm: " + String(alarm_buffer_size));
   
-//   if (maxLine >= 0) {
-//     write_line("/data.txt", data.c_str(), maxLine + 1);
-//   } else {
-//     write_file("/data.txt", data.c_str());
-//   }
-// }
+  // Flush record_buffer with better error handling
+  if (record_buffer_size > 0) {
+    String rtc_date = rtc_get_date();
+    record_file = SD.open(("/record_" + rtc_date + ".txt").c_str(), FILE_APPEND);
 
-void reset_alarm() {
-  is_alarm = false;
-
-  for (uint8_t i = 0; i < sizeof(mcp) / sizeof(mcp[0]); i++) {
-    alarm_message[i] = "";
-    mcp9600_alarm[i] = false;
-  }
-}
-
-void check_alarm() {
-  is_alarm = false;
-
-  for (uint8_t i = 0; i < sizeof(mcp) / sizeof(mcp[0]); i++) {
-    if (mcp9600_value[i] > mcp9600_max_limit[i]) {
-      is_alarm = true;
-      alarm_message[i] = mcp9600_data_name[i] + " : " + String(mcp9600_value[i]) + " °C is over max limit at " + String(mcp9600_max_limit[i]) + " °C";
-      mcp9600_alarm[i] = true;
-    }else if (mcp9600_value[i] < mcp9600_min_limit[i]) {
-      is_alarm = true;
-      alarm_message[i] = mcp9600_data_name[i] + " : " + String(mcp9600_value[i]) + " °C is under min limit at " + String(mcp9600_min_limit[i]) + " °C";
-      mcp9600_alarm[i] = false;
-    }else {
-      mcp9600_alarm[i] = false;
+    if (!record_file) {
+      Serial.println("Failed to open record file, trying to create new one");
+      record_file = SD.open(("/record_" + rtc_date + ".txt").c_str(), FILE_WRITE);
+      if (record_file) {
+        record_file.close();
+        record_file = SD.open(("/record_" + rtc_date + ".txt").c_str(), FILE_APPEND);
+      }
+    }
+    
+    if (record_file) {
+      for (int i = 0; i < record_buffer_size; i++) {
+        if (record_buffer[i].length() > 10) { // Basic validation
+          record_file.println(record_buffer[i]);
+          Serial.println("Flushed record " + String(i) + ": " + record_buffer[i].substring(0, 50) + "...");
+        }
+        delay(2); // Small delay between writes
+      }
+      record_file.flush();
+      record_file.close();
+      Serial.println("Record buffer flushed successfully: " + String(record_buffer_size) + " records");
+      record_buffer_size = 0;
+    } else {
+      Serial.println("CRITICAL: Failed to flush record buffer - SD card issue!");
     }
   }
+  
+  // Flush alarm_buffer with better error handling
+  if (alarm_buffer_size > 0) {
+    String rtc_date = rtc_get_date();
+    alarm_file = SD.open(("/alarm_" + rtc_date + ".txt").c_str(), FILE_APPEND);
+
+    if (!alarm_file) {
+      alarm_file = SD.open(("/alarm_" + rtc_date + ".txt").c_str(), FILE_WRITE);
+      if (alarm_file) {
+        alarm_file.close();
+        alarm_file = SD.open(("/alarm_" + rtc_date + ".txt").c_str(), FILE_APPEND);
+      }
+    }
+
+    if (alarm_file) {
+      for (int i = 0; i < alarm_buffer_size; i++) {
+        if (alarm_buffer[i].length() > 10) { // Basic validation
+          alarm_file.println(alarm_buffer[i]);
+        }
+        delay(2);
+      }
+      alarm_file.flush();
+      alarm_file.close();
+      Serial.println("Alarm buffer flushed successfully: " + String(alarm_buffer_size) + " records");
+      alarm_buffer_size = 0;
+    } else {
+      Serial.println("CRITICAL: Failed to flush alarm buffer - SD card issue!");
+    }
+  }
+  
+  Serial.println("Buffer flush completed");
 }
 
+//etc
 void store_data_to_server() {
   http.begin(url);
   http.setTimeout(http_timeout);
   http.addHeader("Content-Type", "application/x-www-form-urlencoded");
 
-  String url_encoded_string = "machine_name=" + String(host_name) + "&time_stamp=" + String(rtc_get_timestamp());
+  String url_encoded_string = "machine_name=" + String(host_name);
 
   url_encoded_string += "&data=[";
   for (int i = 0; i < sizeof(mcp9600_address) / sizeof(mcp9600_address[0]); i++) {
-      url_encoded_string += "{\"name\":\"" + mcp9600_data_name[i] + "\",\"value\":" + String(mcp9600_value[i]) + "}";
-      if (i + 1 < sizeof(mcp9600_address) / sizeof(mcp9600_address[0])) {
-        url_encoded_string += ",";
-      }
+    url_encoded_string += "{\"name\":\"" + mcp9600_data_name[i] + "\",\"value\":" + String(mcp9600_value[i]) + "}";
+    if (i + 1 < sizeof(mcp9600_address) / sizeof(mcp9600_address[0])) {
+      url_encoded_string += ",";
+    }
   }
   url_encoded_string += "]";
 
-//  Serial.println(url + url_encoded_string);
-                            
+  //  Serial.println(url + url_encoded_string);
+
+  //  Serial.println("url_encoded_string is : " + url_encoded_string);
   int http_response_code = http.POST(url_encoded_string);
 
   //response monitor
-//  if (http_response_code > 0) {
-//      Serial.print("HTTP Response Code: ");
-//      Serial.println(http_response_code);
-//      String response = http.getString();
-//      Serial.println("Server Response: " + response);
-//  } else {
-//      Serial.print("Error on sending POST: ");
-//      Serial.println(http_response_code);
-//  }
+  if (http_response_code > 0) {
+    Serial.println("Uploaded status : " + String(http_response_code));
+  } else {
+    Serial.println("Upload failed : " + String(http_response_code));
+  }
 
   http.end();
 }
 
 void store_data_from_sd_card_to_server() {
-  int data_line_count = count_line("/data.txt");
-
-  for (int i = 0;i < data_line_count;i++) {
-    
+  if (avialable_sd_card == false) {
+    Serial.println("Not found SD card");
+    return;
   }
+
+  // Merge new data from data.txt into upload_data.txt
+  if (SD.exists("/record_offline.txt")) {
+    File dataFile = SD.open("/record_offline.txt", FILE_READ);
+    File uploadFile = SD.open("/upload_data.txt", FILE_APPEND);
+
+    if (dataFile && uploadFile) {
+      while (dataFile.available()) {
+        String line = dataFile.readStringUntil('\n');
+        uploadFile.println(line);
+        delay(20);
+      }
+      dataFile.close();
+      uploadFile.close();
+      SD.remove("/record_offline.txt");  // Delete data.txt after merging
+      Serial.println("Upload : Done merging data files");
+    } else {
+      Serial.println("Upload failed : Error merging data files");
+      return;
+    }
+  }
+
+  if (!SD.exists("/upload_data.txt")) {
+    Serial.println("Upload failed : No upload data available");
+    return;
+  }
+
+  delay(20);
+
+  myFile = SD.open("/upload_data.txt");
+  if (myFile) {
+    while (myFile.available()) {
+      String raw_data = myFile.readStringUntil('\n');
+
+      //      Serial.println("checking blank data");
+      raw_data.trim();
+      if (raw_data.length() == 0) {
+        Serial.println("skip blank line");
+      } else {
+        //        Serial.println("json decoding");
+
+        StaticJsonDocument<1024> jsonDoc;  // Allocate memory for JSON parsing
+
+        DeserializationError error = deserializeJson(jsonDoc, raw_data);
+        if (error) {
+          Serial.print("Upload failed : JSON Parsing failed: ");
+          Serial.println(error.c_str());
+          continue;
+        }
+
+        if (jsonDoc.containsKey("machine_name") && jsonDoc.containsKey("data") && jsonDoc.containsKey("second")) {
+          String data_str;
+          JsonArray data_array = jsonDoc["data"].as<JsonArray>();
+          for (JsonObject obj : data_array) {
+            if (!data_str.isEmpty()) data_str += ",";  // Separate values with a comma
+            data_str += "{\"name\":\"" + obj["name"].as<String>() + "\",\"value\":" + String(obj["value"].as<float>()) +
+                        ",\"min_limit\":" + String(obj["min_limit"].as<float>()) + ",\"max_limit\":" + String(obj["max_limit"].as<float>()) + "}";
+          }
+          //          data_str.replace("\"", "\\\"");
+
+          String url_encoded_string = "machine_name=" + String(jsonDoc["machine_name"].as<const char*>()) +
+                                      "&data=[" + data_str + "]" +
+                                      "&time_stamp=" + String(jsonDoc["second"].as<long>());
+
+          //            Serial.println("url_encoded_string is : " + url_encoded_string);
+
+          http.begin(url);
+          http.setTimeout(http_timeout);
+          http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+
+          int http_response_code = http.POST(url_encoded_string);
+
+          if (http_response_code > 0) {
+            Serial.println("Uploaded status : " + String(http_response_code));
+          } else {
+            Serial.println("Upload failed : " + String(http_response_code));
+          }
+
+          http.end();
+        } else {
+          Serial.println("Upload failed : Missing keys in JSON");
+        }
+      }
+
+      delay(1);
+    }
+    myFile.close();
+    remove_file("/upload_data.txt");
+    remove_file("/record_offline.txt");
+
+    //    SD.remove("/upload.txt");
+
+    //    if (SD.exists("/upload_datas.txt")) {
+    //      if (SD.rename("/upload_datas.txt", "/upload.txt")) {
+    //        Serial.println("Renamed upload_datas.txt to upload.txt");
+    //      } else {
+    //        Serial.println("Rename failed");
+    //      }
+    //    } else {
+    //      Serial.println("upload_datas.txt not found");
+    //    }
+  } else {
+    Serial.println("error opening file for reading line");
+  }
+
+  Serial.println("Upload process completed");
+}
+
+void update_status() {
+  bool temp_is_warning = false; //for temporary led
+  bool temp_is_alarm = false; //for temporary led, buzzer
+
+  temp_is_warning = temp_is_warning || !avialable_sd_card;
+  temp_is_warning = temp_is_warning || !avialable_wifi;
+
+  for (uint8_t i = 0; i < sizeof(mcp) / sizeof(mcp[0]); i++) {
+    temp_is_alarm = temp_is_alarm || mcp9600_alarm[i];
+  }
+
+  is_warning = temp_is_warning;
+
+  if (is_alarm == false) {
+    is_alarm = temp_is_alarm;
+  }
+  //  Serial.println(String(avialable_sd_card) + " : " + String(is_running) + " : " + String(is_warning) + " : " + String(is_alarm));
 }
 
 void core_0(void *not_use) {
-  while(true) {
+  while (true) {
+    working_time_millis_now = millis();
     display_millis_now = millis();
     sd_card_millis_now = millis();
-    
+
+
+    //set reset 1 hr time and reset when free heap is least than some number to prevent esp not response
+    //    if (ESP.getFreeHeap() < 50000 || working_time_millis_now - working_time_millis_old >= 60000) {
+    //      ESP.restart();
+    //    }
+
     update_mcp9600_value();
+    update_status();
     update_led_status();
     update_buzzer_status();
+    update_alarm_rom();
 
     //store data to sd card
-    if (sd_card_millis_now - sd_card_millis_old >= 1000 && WiFi.status() != WL_CONNECTED) {
+    rtc_date_time = rtc_get_date_time();
+    if (sd_card_millis_now - sd_card_millis_old >= 1000 && avialable_sd_card == true && rtc_date_time_old != rtc_date_time) {
       store_data_to_sd_card();
       sd_card_millis_old = sd_card_millis_now;
+      rtc_date_time_old = rtc_date_time;
+    }
+
+    // More frequent buffer flush checks - every 15 seconds
+    if (millis() - last_sd_check >= 15000) {
+      if (!SD.begin(CS)) {
+        avialable_sd_card = false;
+        while (!SD.begin(CS)) {
+          Serial.println("SD card reinitialization failed! Retrying...");
+          delay(100);
+          reconnect_sd_card_count++;
+          if (reconnect_sd_card_count > 5) {
+            reconnect_sd_card_count = 0;
+            break;
+          }
+        }
+        if (!SD.begin(CS)) {
+          Serial.println("SD card reinitialization fail.");
+          avialable_sd_card = false;
+        } else {
+          Serial.println("SD card reinitialized successfully.");
+          avialable_sd_card = true;
+        }
+      }
     }
 
     //switch display
@@ -500,87 +921,99 @@ void core_0(void *not_use) {
         display_panel += 1;
         display_millis_old = display_millis_now;
       }
-    }else {
+    } else {
       if (display_millis_now - display_millis_old >= 5000) {
+        //        Serial.println("count line is : " + String(count_line("/data.txt")));
         display_panel += 1;
         display_millis_old = display_millis_now;
-    //    Serial.println("***** show data record ***");
-    //    read_file("/data.txt");
+
+
+        //        if (avialable_sd_card == true) {
+        //          myFile = SD.open("/data.txt");
+        //          if (myFile) {
+        //            myFile.close();
+        //          }else {
+        //            ESP.restart(); //reset esp to clear cache sd card alway can detect whenever sd card is uninstalled for prepare SD card that reinstall for next time
+        //          }
+        //        }
       }
     }
-  
+
     display.clearDisplay();
     if (display_panel == 1) {
       display_1();
-    }else if (display_panel == 2) {
+    } else if (display_panel == 2) {
       display_2();
-    }else {
+    } else if (display_panel == 3) {
+      display_3();
+    } else {
       display_panel = 0;
       //free display prevent oled display burn for run as long time
       //the display should be black (off) for a second
     }
     display.display();
+
+    if (digitalRead(0) == LOW) {
+      //unload sd card
+      if (myFile) myFile.close();
+      if (record_file) record_file.close();
+      if (alarm_file) alarm_file.close();
+      SD.end();
   
+      while(true) {
+        digitalWrite(led_green, HIGH);
+        digitalWrite(led_yellow, HIGH);
+        digitalWrite(led_red, HIGH);
+        delay(500);
+        digitalWrite(led_green, LOW);
+        digitalWrite(led_yellow, LOW);
+        digitalWrite(led_red, LOW);
+        delay(500);
+      }
+    }
+
     vTaskDelay(pdMS_TO_TICKS(100));
   }
 }
 
 void core_1(void *not_use) {
-  while(true) {
+  while (true) {
     Serial.printf("Total heap: %d Free heap: %d\n", ESP.getHeapSize(), ESP.getFreeHeap());
     delay(500);
 
     if (WiFi.status() != WL_CONNECTED) {
+      avialable_wifi = false;
+
       WiFi.begin(ssid, password);
       Serial.println("Connecting to WiFi...");
       while (WiFi.status() != WL_CONNECTED) {
         delay(10);
-        Serial.print(".");
+        //        Serial.print(".");
         reconnect_wifi_count++;
         if (reconnect_wifi_count >= 1000) {
-    //      ESP.restart();
+          //      ESP.restart();
           reconnect_wifi_count = 0;
           break;
         }
       }
 
-      if (WiFi.status() == WL_CONNECTED) {
-        //start OTA upload
-        ArduinoOTA.setHostname(host_name);
-    
-        ArduinoOTA
-          .onStart([]() {
-            String type;
-            if (ArduinoOTA.getCommand() == U_FLASH)
-              type = "sketch";
-            else
-              type = "filesystem";
-            Serial.println("Start updating " + type);
-          })
-          .onEnd([]() {
-            Serial.println("\nEnd");
-          })
-          .onProgress([](unsigned int progress, unsigned int total) {
-            Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
-          })
-          .onError([](ota_error_t error) {
-            Serial.printf("Error[%u]: ", error);
-            if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
-            else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
-            else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
-            else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
-            else if (error == OTA_END_ERROR) Serial.println("End Failed");
-        });
-    
-        ArduinoOTA.begin();
+      if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("fail connection");
+        avialable_wifi = false;
+      } else {
+        Serial.println("done connection");
+        avialable_wifi = true;
       }
+    } else {
+      avialable_wifi = true;
+      ArduinoOTA.handle();
     }
 
-    if (WiFi.status() == WL_CONNECTED) {
+    if (avialable_wifi == true) {
       //store data to server
       store_data_to_server();
     }
-    
+
     vTaskDelay(pdMS_TO_TICKS(100));
   }
 }
@@ -588,43 +1021,35 @@ void core_1(void *not_use) {
 void setup() {
   Serial.begin(2000000);
 
-  //wifi
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, password);
-  Serial.println("Connecting to WiFi...");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(10);
-    Serial.print(".");
-    reconnect_wifi_count++;
-    if (reconnect_wifi_count >= 1000) {
-//      ESP.restart();
-      reconnect_wifi_count = 0;
-      break;
-    }
-  }
-
   //for mcp9600, sd_card
   while (!Serial) {
     delay(10);
   }
 
-  //sd_card
-//  while (!SD.begin(CS)) {
-//    Serial.println("SD card initialization failed! Retrying...");
-//    delay(1000);
-//  }
-//  Serial.println("SD card initialization done.");
+  //rom data
+  preferences.begin("alarm", false);
+  is_running = preferences.getBool("is_running", false);
+  is_warning = preferences.getBool("is_warning", false);
+  is_alarm = preferences.getBool("is_alarm", false);
+  preferences.end();
 
-  if (!SD.begin(CS)) {
-    Serial.println("SD card initialization failed! Retrying...");
-    delay(1000);
-    if (!SD.begin(CS)) {
-      Serial.println("SD card initialization fail.");
-    }
-  }else {
-    Serial.println("SD card initialization done.");
+  //boot button
+  pinMode(0, INPUT_PULLUP);
+
+  //trimmer
+  for (int i = 0; i < sizeof(trimmer) / sizeof(trimmer[0]); i++) {
+    pinMode(trimmer[i], INPUT);
   }
-  
+
+  //led
+  pinMode(led_green, OUTPUT);
+  pinMode(led_yellow, OUTPUT);
+  pinMode(led_red, OUTPUT);
+
+  //buzzer
+  ledcSetup(0, freq, resolution); //2.7kHz, 8-bit resolution 0-255
+  ledcAttachPin(buzzer, 0);
+
   //init oled
   display.begin(SSD1306_SWITCHCAPVCC, 0x3c);
   display.ssd1306_command(SSD1306_SETCONTRAST);
@@ -632,9 +1057,71 @@ void setup() {
   display.clearDisplay();
   display.setTextSize(1);
   display.setTextColor(WHITE);
-  display.setCursor(0,0);
+  display.setCursor(0, 0);
   display.println("Strating...");
+
+  display.setCursor(0, 8);
+  display.println("SD card...");
   display.display();
+
+  //sd_card
+  while (!SD.begin(CS)) {
+    Serial.println("SD card initialization failed! Retrying...");
+    delay(1000);
+    reconnect_sd_card_count++;
+
+    if (reconnect_sd_card_count > 20) {
+      reconnect_sd_card_count = 0;
+      break;
+    }
+  }
+
+  if (!SD.begin(CS)) {
+    Serial.println("SD card initialization fail.");
+    display.setCursor(0, 8);
+    display.println("SD card...fail");
+
+    avialable_sd_card = false;
+  } else {
+    Serial.println("SD card initialization done.");
+    display.setCursor(0, 8);
+    display.println("SD card...done");
+
+    avialable_sd_card = true;
+  }
+
+  display.setCursor(0, 16);
+  display.println("Wi-Fi...");
+  display.display();
+
+  //wifi
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  Serial.println("Connecting to WiFi...");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(10);
+    //    Serial.print(".");
+    reconnect_wifi_count++;
+    if (reconnect_wifi_count >= 1000) {
+      //      ESP.restart();
+      reconnect_wifi_count = 0;
+      break;
+    }
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("fail connection");
+    avialable_wifi = false;
+
+    display.setCursor(0, 16);
+    display.println("Wi-Fi...fail");
+  } else {
+    Serial.println("done connection");
+    avialable_wifi = true;
+
+    display.setCursor(0, 16);
+    display.println("Wi-Fi...done");
+  }
 
   //init mcp9600
   for (uint8_t i = 0; i < sizeof(mcp9600_address); i++) {
@@ -642,7 +1129,7 @@ void setup() {
       Serial.print("**********Found MCP9600 at address 0x");
       Serial.print(mcp9600_address[i], HEX);
       Serial.println("**********");
-      
+
       mcp[i].setAmbientResolution(ambientRes);
       Serial.print("Ambient Resolution set to: ");
       switch (ambientRes) {
@@ -677,7 +1164,7 @@ void setup() {
       Serial.println(" type");
 
       mcp[i].enable(true);
-    }else {
+    } else {
       Serial.print("Notfound MCP9600 at address 0x");
       Serial.println(mcp9600_address[i], HEX);
       Serial.println("Check wiring!");
@@ -685,34 +1172,69 @@ void setup() {
     }
   }
 
-  //trimmer
-  for (int i = 0; i < sizeof(trimmer) / sizeof(trimmer[0]); i++) {
-    pinMode(trimmer[i], INPUT);
-  }
-
-  //led
-  pinMode(led_green, OUTPUT);
-  pinMode(led_yellow, OUTPUT);
-  pinMode(led_red, OUTPUT);
-
-  //buzzer
-  ledcSetup(0, freq, resolution); //2.7kHz, 8-bit resolution 0-255
-  ledcAttachPin(buzzer, 0);
-
   //pcf8563
   rtc.begin();
-//  rtc.setDateTime(2025, 2, 17, 12, 34, 00);
-//
-//  while(true) {
-//    delay(100);
-//  }
-  
-  display.clearDisplay();
+// rtc.setDateTime(2025, 6, 25, 11, 22, 00);
+  //
+  //  while(true) {
+  //    delay(100);
+  //  }
 
   is_running = true;
 
+  display.setCursor(0, 24);
+  display.println("Uploading data...");
+  display.display();
+
+  if (avialable_wifi == true) {
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.println("Uploading data...");
+    display.display();
+    // store_data_from_sd_card_to_server();
+  }
+
+  //start OTA upload
+  ArduinoOTA.setHostname(host_name);
+
+  ArduinoOTA
+  .onStart([]() {
+    String type;
+    if (ArduinoOTA.getCommand() == U_FLASH)
+      type = "sketch";
+    else
+      type = "filesystem";
+    Serial.println("Start updating " + type);
+  })
+  .onEnd([]() {
+    Serial.println("\nEnd");
+  })
+  .onProgress([](unsigned int progress, unsigned int total) {
+    Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
+  })
+  .onError([](ota_error_t error) {
+    Serial.printf("Error[%u]: ", error);
+    if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
+    else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
+    else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
+    else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
+    else if (error == OTA_END_ERROR) Serial.println("End Failed");
+  });
+
+  ArduinoOTA.begin();
+
+  display.setCursor(0, 24);
+  display.println("Uploading data...done");
+  display.display();
+
+  delay(1000);
+
+  display.clearDisplay();
+
+  working_time_millis_now = millis();
   display_millis_now = millis();
   sd_card_millis_now = millis();
+  working_time_millis_old = working_time_millis_now;
   display_millis_old = display_millis_now;
   sd_card_millis_old = sd_card_millis_now;
 
@@ -735,9 +1257,6 @@ void setup() {
     NULL,         // Task handle
     1             // Core ID
   );
-
-//  remove_file("/data.txt");
-//  write_file("/data.txt", "");
 }
 
 void loop() {
